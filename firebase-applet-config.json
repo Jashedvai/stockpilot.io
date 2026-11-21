@@ -3,6 +3,7 @@
   "appId": "1:860112458743:web:cc5a2252f1c8eeb04314f2",
   "apiKey": "AIzaSyB3VDzIQzgw9hxGJZ18SqJf3F74htlycmY",
   "authDomain": "semiotic-pen-67cvm.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-stockpilot-f38b2538-c54b-4e54-9f13-dfab2605e8ef",
   "storageBucket": "semiotic-pen-67cvm.firebasestorage.app",
   "messagingSenderId": "860112458743",
   "measurementId": "",

@@ -1,16 +1,19 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { FileText, Plus, Printer, Search, Trash2, X } from 'lucide-react';
+import { CheckCircle2, FileText, Plus, Printer, ScanBarcode, Search, Trash2, X } from 'lucide-react';
 import { CurrencyCode, Product, Sale } from '../types';
 import { apiRequest, formatDateTime, formatMoney } from '../lib/api';
 import { appleAlertVariants } from '../lib/motion';
+import { playSaleCompleteSound, playScanErrorSound, playScanSuccessSound } from '../lib/sound';
 import { AppleModal } from './AppleMotion';
+import { BarcodeScanner } from './BarcodeScanner';
 
 interface SalesViewProps {
   sales: Sale[];
   products: Product[];
   currency: CurrencyCode;
   onRefresh: () => Promise<void>;
+  openCreateTrigger?: number;
 }
 
 interface SaleDraftItem {
@@ -19,10 +22,21 @@ interface SaleDraftItem {
   unit_price: number;
 }
 
+interface ScanFeedback {
+  kind: 'success' | 'error';
+  text: string;
+}
+
 const inputCls =
   'w-full px-3.5 py-2 text-sm rounded-[10px] glass-input text-[#1d1d1f] dark:text-white placeholder:text-[#86868b] focus:outline-none focus:border-[#0071e3] focus:bg-white/85 dark:focus:bg-[#1c1c1e]/85';
 
-export const SalesView: React.FC<SalesViewProps> = ({ sales, products, currency, onRefresh }) => {
+export const SalesView: React.FC<SalesViewProps> = ({
+  sales,
+  products,
+  currency,
+  onRefresh,
+  openCreateTrigger = 0,
+}) => {
   const [search, setSearch] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [activeInvoice, setActiveInvoice] = useState<Sale | null>(null);
@@ -32,8 +46,15 @@ export const SalesView: React.FC<SalesViewProps> = ({ sales, products, currency,
   const [discount, setDiscount] = useState('0');
   const [paymentMethod, setPaymentMethod] = useState('bKash');
   const [items, setItems] = useState<SaleDraftItem[]>([]);
+  const [isDefaultPlaceholder, setIsDefaultPlaceholder] = useState(true);
+
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [barcodeInput, setBarcodeInput] = useState('');
+  const [scanFeedback, setScanFeedback] = useState<ScanFeedback | null>(null);
+
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const lastTriggerRef = useRef(0);
 
   const inStockProducts = useMemo(() => products.filter((p) => p.stock_qty > 0), [products]);
 
@@ -48,24 +69,42 @@ export const SalesView: React.FC<SalesViewProps> = ({ sales, products, currency,
     );
   }, [sales, search]);
 
-  const openCreateModal = () => {
+  const openCreateModal = useCallback(() => {
     setError(null);
+    setScanFeedback(null);
+    setBarcodeInput('');
+    setScannerOpen(false);
     setCustomerName('');
     setCustomerPhone('');
     setDiscount('0');
     setPaymentMethod('bKash');
     const first = inStockProducts[0];
     setItems(first ? [{ product_id: String(first.id), quantity: 1, unit_price: first.selling_price }] : []);
+    setIsDefaultPlaceholder(Boolean(first));
     setShowCreateModal(true);
+  }, [inStockProducts]);
+
+  useEffect(() => {
+    if (openCreateTrigger > 0 && openCreateTrigger !== lastTriggerRef.current) {
+      lastTriggerRef.current = openCreateTrigger;
+      openCreateModal();
+    }
+  }, [openCreateTrigger, openCreateModal]);
+
+  const closeCreateModal = () => {
+    setScannerOpen(false);
+    setShowCreateModal(false);
   };
 
   const addLineItem = () => {
     const first = inStockProducts[0];
     if (!first) return;
+    setIsDefaultPlaceholder(false);
     setItems((prev) => [...prev, { product_id: String(first.id), quantity: 1, unit_price: first.selling_price }]);
   };
 
   const updateLineItem = (idx: number, patch: Partial<SaleDraftItem>) => {
+    setIsDefaultPlaceholder(false);
     setItems((prev) =>
       prev.map((item, i) => {
         if (i !== idx) return item;
@@ -80,8 +119,83 @@ export const SalesView: React.FC<SalesViewProps> = ({ sales, products, currency,
   };
 
   const removeLineItem = (idx: number) => {
+    setIsDefaultPlaceholder(false);
     setItems((prev) => prev.filter((_, i) => i !== idx));
   };
+
+  const handleAddByCode = useCallback(
+    (rawCode: string) => {
+      const trimmed = rawCode.trim();
+      if (!trimmed) return;
+      const normalized = trimmed.toLowerCase();
+      const compact = normalized.replace(/[^a-z0-9]/g, '');
+
+      const matched =
+        products.find((p) => p.sku.toLowerCase() === normalized) ||
+        products.find((p) => String(p.id) === normalized) ||
+        products.find((p) => p.sku.toLowerCase().replace(/[^a-z0-9]/g, '') === compact);
+
+      if (!matched) {
+        playScanErrorSound();
+        setScanFeedback({
+          kind: 'error',
+          text: `No product matched code "${trimmed}".`,
+        });
+        return;
+      }
+
+      if (matched.stock_qty <= 0) {
+        playScanErrorSound();
+        setScanFeedback({
+          kind: 'error',
+          text: `${matched.name} (${matched.sku}) is out of stock.`,
+        });
+        return;
+      }
+
+      setItems((prev) => {
+        const baseList = isDefaultPlaceholder ? [] : prev;
+        const existingIdx = baseList.findIndex((item) => item.product_id === String(matched.id));
+
+        if (existingIdx >= 0) {
+          const currentQty = baseList[existingIdx].quantity;
+          if (currentQty >= matched.stock_qty) {
+            playScanErrorSound();
+            setScanFeedback({
+              kind: 'error',
+              text: `Maximum available stock reached for ${matched.name} (${matched.stock_qty}).`,
+            });
+            return baseList;
+          }
+          const nextQty = currentQty + 1;
+          playScanSuccessSound();
+          setScanFeedback({
+            kind: 'success',
+            text: `Updated ${matched.name} (${matched.sku}) quantity to ${nextQty}.`,
+          });
+          return baseList.map((item, i) => (i === existingIdx ? { ...item, quantity: nextQty } : item));
+        }
+
+        playScanSuccessSound();
+        setScanFeedback({
+          kind: 'success',
+          text: `Added ${matched.name} (${matched.sku}).`,
+        });
+        return [
+          ...baseList,
+          {
+            product_id: String(matched.id),
+            quantity: 1,
+            unit_price: matched.selling_price,
+          },
+        ];
+      });
+
+      setIsDefaultPlaceholder(false);
+      setBarcodeInput('');
+    },
+    [products, isDefaultPlaceholder]
+  );
 
   const draftSubtotal = items.reduce((acc, item) => acc + item.quantity * item.unit_price, 0);
   const draftTotal = Math.max(0, draftSubtotal - (Number(discount) || 0));
@@ -109,7 +223,8 @@ export const SalesView: React.FC<SalesViewProps> = ({ sales, products, currency,
           })),
         }),
       });
-      setShowCreateModal(false);
+      playSaleCompleteSound();
+      closeCreateModal();
       setActiveInvoice(created);
       await onRefresh();
     } catch (err: unknown) {
@@ -231,157 +346,235 @@ export const SalesView: React.FC<SalesViewProps> = ({ sales, products, currency,
       </div>
 
       {/* Create Sales Invoice Modal */}
-      <AppleModal open={showCreateModal} onClose={() => setShowCreateModal(false)} maxWidthClass="max-w-2xl max-h-[90vh] flex flex-col">
+      <AppleModal open={showCreateModal} onClose={closeCreateModal} maxWidthClass="max-w-2xl max-h-[90vh] flex flex-col">
         <div className="px-6 py-4 border-b border-black/[0.06] dark:border-white/[0.08] flex items-center justify-between">
           <h3 className="text-base font-display font-semibold text-[#1d1d1f] dark:text-white">
             New Stock-Out Sales Invoice
           </h3>
-          <button type="button" onClick={() => setShowCreateModal(false)} className="text-[#86868b]">
+          <button type="button" onClick={closeCreateModal} className="text-[#86868b]" aria-label="Close modal">
             <X className="w-5 h-5" />
           </button>
         </div>
 
         <form onSubmit={handleSubmit} className="p-6 space-y-4 overflow-y-auto">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">
-                    Customer / Organization Name
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={customerName}
-                    onChange={(e) => setCustomerName(e.target.value)}
-                    placeholder="e.g. Summit Retail Co."
-                    className={inputCls}
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">Phone</label>
-                  <input
-                    type="text"
-                    value={customerPhone}
-                    onChange={(e) => setCustomerPhone(e.target.value)}
-                    placeholder="+880 17..."
-                    className={`${inputCls} font-mono`}
-                  />
-                </div>
-              </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="sm:col-span-2">
+              <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">
+                Customer / Organization Name
+              </label>
+              <input
+                type="text"
+                required
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                placeholder="e.g. Summit Retail Co."
+                className={inputCls}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">Phone</label>
+              <input
+                type="text"
+                value={customerPhone}
+                onChange={(e) => setCustomerPhone(e.target.value)}
+                placeholder="+880 17..."
+                className={`${inputCls} font-mono`}
+              />
+            </div>
+          </div>
 
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7]">Invoice Line Items</label>
-                  <button
-                    type="button"
-                    onClick={addLineItem}
-                    className="text-xs font-medium text-[#0071e3] dark:text-[#0a84ff] hover:underline"
-                  >
-                    + Add Product
-                  </button>
-                </div>
-                <div className="space-y-2">
-                  {items.map((item, idx) => {
-                    const matched = products.find((p) => String(p.id) === item.product_id);
-                    return (
-                      <div key={idx} className="grid grid-cols-12 gap-2 items-center">
-                        <select
-                          value={item.product_id}
-                          onChange={(e) => updateLineItem(idx, { product_id: e.target.value })}
-                          className="col-span-6 px-2.5 py-2 text-xs rounded-[10px] glass-input text-[#1d1d1f] dark:text-white"
-                        >
-                          {inStockProducts.map((p) => (
-                            <option key={p.id} value={p.id}>
-                              {p.name} (Avail: {p.stock_qty})
-                            </option>
-                          ))}
-                        </select>
-                        <input
-                          type="number"
-                          min="1"
-                          max={matched?.stock_qty ?? 9999}
-                          value={item.quantity}
-                          onChange={(e) => updateLineItem(idx, { quantity: Math.max(1, Number(e.target.value)) })}
-                          className="col-span-2 px-2.5 py-2 text-xs font-mono rounded-[10px] glass-input text-[#1d1d1f] dark:text-white"
-                        />
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          value={item.unit_price}
-                          onChange={(e) => updateLineItem(idx, { unit_price: Math.max(0, Number(e.target.value)) })}
-                          className="col-span-3 px-2.5 py-2 text-xs font-mono rounded-[10px] glass-input text-[#1d1d1f] dark:text-white"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => removeLineItem(idx)}
-                          disabled={items.length === 1}
-                          className="col-span-1 flex justify-center text-[#86868b] hover:text-[#d70015] disabled:opacity-30"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
+          {/* Quick Barcode / SKU Lookup & Device Camera Scanner */}
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7]">
+                Quick add by barcode or SKU
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  setScanFeedback(null);
+                  setScannerOpen((prev) => !prev);
+                }}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  scannerOpen
+                    ? 'bg-[#0071e3] text-white'
+                    : 'glass-inset text-[#1d1d1f] dark:text-white hover:bg-white/75 dark:hover:bg-white/[0.12]'
+                }`}
+              >
+                <ScanBarcode className="w-3.5 h-3.5" />
+                <span>{scannerOpen ? 'Hide camera' : 'Scan barcode'}</span>
+              </button>
+            </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">
-                    Discount (৳)
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    value={discount}
-                    onChange={(e) => setDiscount(e.target.value)}
-                    className={`${inputCls} font-mono`}
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">
-                    Payment Method
-                  </label>
-                  <select
-                    value={paymentMethod}
-                    onChange={(e) => setPaymentMethod(e.target.value)}
-                    className={inputCls}
-                  >
-                    <option value="bKash">bKash</option>
-                    <option value="Nagad">Nagad</option>
-                    <option value="Cash">Cash</option>
-                    <option value="Card">Card</option>
-                    <option value="Bank Transfer">Bank Transfer</option>
-                  </select>
-                </div>
-              </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={barcodeInput}
+                onChange={(e) => setBarcodeInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleAddByCode(barcodeInput);
+                  }
+                }}
+                placeholder="Scan or enter SKU (e.g. BD-IP16PM-256)"
+                className={`${inputCls} font-mono text-xs`}
+              />
+              <button
+                type="button"
+                onClick={() => handleAddByCode(barcodeInput)}
+                disabled={!barcodeInput.trim()}
+                className="px-4 py-2 rounded-[10px] glass-inset text-xs font-medium text-[#1d1d1f] dark:text-white hover:bg-white/75 dark:hover:bg-white/[0.12] disabled:opacity-40 whitespace-nowrap"
+              >
+                Add SKU
+              </button>
+            </div>
 
-              <div className="pt-3 border-t border-black/[0.06] dark:border-white/[0.08] flex items-center justify-between">
-                <div className="text-sm text-[#1d1d1f] dark:text-[#f5f5f7]">
-                  Net Payable:{' '}
-                  <span className="font-mono font-semibold text-[#248a3d] dark:text-[#30d158]">
-                    {formatMoney(draftTotal, currency)}
+            <BarcodeScanner
+              active={scannerOpen && showCreateModal}
+              onDetected={handleAddByCode}
+              onClose={() => setScannerOpen(false)}
+            />
+
+            <AnimatePresence>
+              {scanFeedback && (
+                <motion.div
+                  key={scanFeedback.text}
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  className={`px-3 py-2 rounded-xl text-xs flex items-center justify-between gap-2 ${
+                    scanFeedback.kind === 'success'
+                      ? 'bg-[#34c759]/12 border border-[#34c759]/25 text-[#1f7a34] dark:text-[#30d158]'
+                      : 'bg-[#ff3b30]/12 border border-[#ff3b30]/25 text-[#d70015] dark:text-[#ff453a]'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    {scanFeedback.kind === 'success' && <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />}
+                    <span>{scanFeedback.text}</span>
                   </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowCreateModal(false)}
-                    className="px-4 py-2 text-xs font-medium rounded-full glass-inset text-[#1d1d1f] dark:text-[#f5f5f7]"
-                  >
-                    Cancel
+                  <button type="button" onClick={() => setScanFeedback(null)} aria-label="Dismiss scan message">
+                    <X className="w-3.5 h-3.5" />
                   </button>
-                  <button
-                    type="submit"
-                    disabled={submitting || inStockProducts.length === 0}
-                    className="px-4 py-2 text-xs font-medium rounded-full bg-[#0071e3] hover:bg-[#0077ed] text-white disabled:opacity-60"
-                  >
-                    {submitting ? 'Processing...' : 'Complete Sale & Deduct Stock'}
-                  </button>
-                </div>
-              </div>
-            </form>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7]">Invoice Line Items</label>
+              <button
+                type="button"
+                onClick={addLineItem}
+                className="text-xs font-medium text-[#0071e3] dark:text-[#0a84ff] hover:underline"
+              >
+                + Add Product
+              </button>
+            </div>
+            <div className="space-y-2">
+              {items.map((item, idx) => {
+                const matched = products.find((p) => String(p.id) === item.product_id);
+                return (
+                  <div key={idx} className="grid grid-cols-12 gap-2 items-center">
+                    <select
+                      value={item.product_id}
+                      onChange={(e) => updateLineItem(idx, { product_id: e.target.value })}
+                      className="col-span-6 px-2.5 py-2 text-xs rounded-[10px] glass-input text-[#1d1d1f] dark:text-white"
+                    >
+                      {inStockProducts.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} (Avail: {p.stock_qty})
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      min="1"
+                      max={matched?.stock_qty ?? 9999}
+                      value={item.quantity}
+                      onChange={(e) => updateLineItem(idx, { quantity: Math.max(1, Number(e.target.value)) })}
+                      className="col-span-2 px-2.5 py-2 text-xs font-mono rounded-[10px] glass-input text-[#1d1d1f] dark:text-white"
+                    />
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={item.unit_price}
+                      onChange={(e) => updateLineItem(idx, { unit_price: Math.max(0, Number(e.target.value)) })}
+                      className="col-span-3 px-2.5 py-2 text-xs font-mono rounded-[10px] glass-input text-[#1d1d1f] dark:text-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeLineItem(idx)}
+                      disabled={items.length === 1}
+                      className="col-span-1 flex justify-center text-[#86868b] hover:text-[#d70015] disabled:opacity-30"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">
+                Discount (৳)
+              </label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={discount}
+                onChange={(e) => setDiscount(e.target.value)}
+                className={`${inputCls} font-mono`}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-[#1d1d1f] dark:text-[#f5f5f7] mb-1">
+                Payment Method
+              </label>
+              <select
+                value={paymentMethod}
+                onChange={(e) => setPaymentMethod(e.target.value)}
+                className={inputCls}
+              >
+                <option value="bKash">bKash</option>
+                <option value="Nagad">Nagad</option>
+                <option value="Cash">Cash</option>
+                <option value="Card">Card</option>
+                <option value="Bank Transfer">Bank Transfer</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="pt-3 border-t border-black/[0.06] dark:border-white/[0.08] flex items-center justify-between">
+            <div className="text-sm text-[#1d1d1f] dark:text-[#f5f5f7]">
+              Net Payable:{' '}
+              <span className="font-mono font-semibold text-[#248a3d] dark:text-[#30d158]">
+                {formatMoney(draftTotal, currency)}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={closeCreateModal}
+                className="px-4 py-2 text-xs font-medium rounded-full glass-inset text-[#1d1d1f] dark:text-[#f5f5f7]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={submitting || inStockProducts.length === 0 || items.length === 0}
+                className="px-4 py-2 text-xs font-medium rounded-full bg-[#0071e3] hover:bg-[#0077ed] text-white disabled:opacity-60"
+              >
+                {submitting ? 'Processing...' : 'Complete Sale & Deduct Stock'}
+              </button>
+            </div>
+          </div>
+        </form>
       </AppleModal>
 
       {/* Printable Invoice Receipt Modal */}

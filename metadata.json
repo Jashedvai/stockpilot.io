@@ -1,7 +1,7 @@
 {
   "name": "StockPilot",
   "description": "Centralized Inventory Management System for products, stock, suppliers, purchases, sales, employees, and financial records.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]

@@ -14,11 +14,14 @@ import {
   Sun,
   Truck,
   Users,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './lib/firebase';
 import { apiRequest, setAuthToken } from './lib/api';
+import { playClickSound, setSoundEnabled } from './lib/sound';
 import { APPLE_EASE, APPLE_SPRING } from './lib/motion';
 import {
   Category,
@@ -64,6 +67,8 @@ export default function App() {
   const [activeSection, setActiveSection] = useState<NavSection>('overview');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
+  const [soundOn, setSoundOn] = useState(true);
+  const [newSaleTrigger, setNewSaleTrigger] = useState(0);
   const [currency, setCurrency] = useState<CurrencyCode>('BDT');
 
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
@@ -82,6 +87,25 @@ export default function App() {
     if (darkMode) root.classList.add('dark');
     else root.classList.remove('dark');
   }, [darkMode]);
+
+  useEffect(() => {
+    setSoundEnabled(soundOn);
+  }, [soundOn]);
+
+  useEffect(() => {
+    const handleGlobalClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const interactive = target.closest('button, a, select, [role="button"], summary') as
+        | (HTMLElement & { disabled?: boolean })
+        | null;
+      if (!interactive || interactive.disabled) return;
+      if (interactive.dataset.soundToggle === 'true') return;
+      playClickSound();
+    };
+    document.addEventListener('click', handleGlobalClick);
+    return () => document.removeEventListener('click', handleGlobalClick);
+  }, []);
 
   const loadAllData = useCallback(async () => {
     setLoadingData(true);
@@ -348,6 +372,21 @@ export default function App() {
 
             <button
               type="button"
+              data-sound-toggle="true"
+              onClick={() => {
+                const next = !soundOn;
+                setSoundOn(next);
+                setSoundEnabled(next);
+                if (next) playClickSound();
+              }}
+              aria-label={soundOn ? 'Mute click sound effects' : 'Enable click sound effects'}
+              className="p-2 rounded-full glass-inset text-[#5a5a60] dark:text-[#a1a1a6] hover:text-[#1d1d1f] dark:hover:text-white hover:bg-white/70 dark:hover:bg-white/[0.12] transition-colors"
+            >
+              {soundOn ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+            </button>
+
+            <button
+              type="button"
               onClick={() => setDarkMode((d) => !d)}
               aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
               className="p-2 rounded-full glass-inset text-[#5a5a60] dark:text-[#a1a1a6] hover:text-[#1d1d1f] dark:hover:text-white hover:bg-white/70 dark:hover:bg-white/[0.12] transition-colors"
@@ -368,7 +407,10 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setActiveSection('sales')}
+              onClick={() => {
+                setActiveSection('sales');
+                setNewSaleTrigger((n) => n + 1);
+              }}
               className="hidden sm:inline-flex px-4 py-1.5 rounded-full bg-[#0071e3] hover:bg-[#0077ed] dark:bg-[#0a84ff] dark:hover:bg-[#1a8cff] text-white text-xs font-medium whitespace-nowrap shrink-0 shadow-[0_4px_14px_rgba(0,113,227,0.3)] transition-colors"
             >
               New Sale
@@ -409,7 +451,13 @@ export default function App() {
               />
             )}
             {activeSection === 'sales' && (
-              <SalesView sales={sales} products={products} currency={currency} onRefresh={loadAllData} />
+              <SalesView
+                sales={sales}
+                products={products}
+                currency={currency}
+                onRefresh={loadAllData}
+                openCreateTrigger={newSaleTrigger}
+              />
             )}
             {activeSection === 'employees' && (
               <EmployeesView employees={employees} currency={currency} onRefresh={loadAllData} />
